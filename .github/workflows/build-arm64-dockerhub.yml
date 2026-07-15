@@ -1,0 +1,292 @@
+name: Build ARM64 Image to Docker Hub
+
+run-name: >-
+  Build ${{ inputs.source_ref }} /
+  ${{ inputs.dockerfile }} to Docker Hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or commit to build
+        required: true
+        default: v0.6.0
+        type: string
+
+      dockerfile:
+        description: Select the Dockerfile to build
+        required: true
+        default: docker/Dockerfile.ucm-vllm-ascend.a2-v0.18.0
+        type: choice
+        options:
+          - docker/Dockerfile.ucm-vllm-ascend.a2-v0.18.0
+          - docker/Dockerfile.ucm-vllm-ascend.a2-v0.20.2rc1
+          - docker/Dockerfile.ucm-vllm-ascend.a3-v0.20.2rc1
+          - docker/Dockerfile.ucm-vllm-ascend.a2-latest
+          - custom
+
+      custom_dockerfile:
+        description: >-
+          Dockerfile path used when dockerfile=custom,
+          for example docker/Dockerfile.example
+        required: false
+        default: ""
+        type: string
+
+      image_tag:
+        description: >-
+          Docker image tag; leave empty to generate one automatically
+        required: false
+        default: ""
+        type: string
+
+      push_latest:
+        description: Also push the image using the latest tag
+        required: true
+        default: false
+        type: boolean
+
+      no_cache:
+        description: Disable Docker build cache
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ucm-arm64-${{ inputs.source_ref }}-${{ inputs.dockerfile }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build and push ARM64 image
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify ARM64 runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          architecture="$(uname -m)"
+          echo "Runner architecture: ${architecture}"
+
+          case "${architecture}" in
+            aarch64|arm64)
+              ;;
+            *)
+              echo "::error::Expected ARM64 runner, got ${architecture}"
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve and validate build settings
+        id: vars
+        shell: bash
+        env:
+          SELECTED_DOCKERFILE: ${{ inputs.dockerfile }}
+          CUSTOM_DOCKERFILE: ${{ inputs.custom_dockerfile }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${DOCKERHUB_USERNAME}" ]]; then
+            echo "::error::Repository variable DOCKERHUB_USERNAME is not configured"
+            exit 1
+          fi
+
+          if [[ -z "${DOCKERHUB_IMAGE}" ]]; then
+            echo "::error::Repository variable DOCKERHUB_IMAGE is not configured"
+            exit 1
+          fi
+
+          # Expected format:
+          # username/repository
+          # organization/repository
+          if [[ ! "${DOCKERHUB_IMAGE}" =~ ^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::Invalid DOCKERHUB_IMAGE: ${DOCKERHUB_IMAGE}"
+            echo "::error::Expected format: namespace/repository"
+            exit 1
+          fi
+
+          dockerfile="${SELECTED_DOCKERFILE}"
+
+          if [[ "${dockerfile}" == "custom" ]]; then
+            dockerfile="${CUSTOM_DOCKERFILE}"
+          fi
+
+          if [[ -z "${dockerfile}" ]]; then
+            echo "::error::custom_dockerfile must be set when dockerfile=custom"
+            exit 1
+          fi
+
+          # Only permit Dockerfiles directly inside docker/.
+          # This prevents path traversal and arbitrary file selection.
+          if [[ ! "${dockerfile}" =~ ^docker/Dockerfile([.A-Za-z0-9_-]+)?$ ]]; then
+            echo "::error::Invalid Dockerfile path: ${dockerfile}"
+            echo "::error::Dockerfile must be located directly under docker/"
+            exit 1
+          fi
+
+          if [[ ! -f "${dockerfile}" ]]; then
+            echo "::error::Dockerfile does not exist at ref ${SOURCE_REF}: ${dockerfile}"
+            echo
+            echo "Available Dockerfiles:"
+            find docker \
+              -maxdepth 1 \
+              -type f \
+              -name 'Dockerfile*' \
+              -print \
+              | sort
+            exit 1
+          fi
+
+          dockerfile_name="$(basename "${dockerfile}")"
+          dockerfile_id="${dockerfile_name#Dockerfile.}"
+
+          tag="${IMAGE_TAG_INPUT}"
+
+          if [[ -z "${tag}" ]]; then
+            tag="${SOURCE_REF}-${dockerfile_id}-arm64"
+          fi
+
+          # Convert the supplied value into a valid lowercase Docker tag.
+          tag="$(
+            printf '%s' "${tag}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E '
+                  s#[^a-z0-9_.-]+#-#g;
+                  s#^[.-]+##;
+                  s#[.-]+$##
+                ' \
+              | cut -c1-128
+          )"
+
+          if [[ -z "${tag}" ]]; then
+            echo "::error::Generated Docker tag is empty"
+            exit 1
+          fi
+
+          if [[ ! "${tag}" =~ ^[a-z0-9_][a-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::Invalid Docker tag: ${tag}"
+            exit 1
+          fi
+
+          image_ref="${DOCKERHUB_IMAGE}:${tag}"
+          source_sha="$(git rev-parse HEAD)"
+
+          cache_scope="$(
+            printf '%s' "arm64-${dockerfile_id}" \
+              | sed -E 's#[^A-Za-z0-9_.-]+#-#g'
+          )"
+
+          {
+            echo "dockerfile=${dockerfile}"
+            echo "dockerfile_id=${dockerfile_id}"
+            echo "image_ref=${image_ref}"
+            echo "source_sha=${source_sha}"
+            echo "cache_scope=${cache_scope}"
+
+            echo "tags<<EOF"
+            echo "${image_ref}"
+
+            if [[ "${PUSH_LATEST}" == "true" ]]; then
+              echo "${DOCKERHUB_IMAGE}:latest"
+            fi
+
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### ARM64 Docker build"
+            echo
+            echo "- Source ref: \`${SOURCE_REF}\`"
+            echo "- Source commit: \`${source_sha}\`"
+            echo "- Dockerfile: \`${dockerfile}\`"
+            echo "- Platform: \`linux/arm64\`"
+            echo "- Image: \`${image_ref}\`"
+
+            if [[ "${PUSH_LATEST}" == "true" ]]; then
+              echo "- Additional tag: \`${DOCKERHUB_IMAGE}:latest\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ARM64 image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          # The UCM Dockerfiles use COPY ., so the build context
+          # must remain the repository root.
+          context: .
+          file: ${{ steps.vars.outputs.dockerfile }}
+
+          platforms: linux/arm64
+          push: true
+          pull: true
+          no-cache: ${{ inputs.no_cache }}
+
+          tags: ${{ steps.vars.outputs.tags }}
+
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.vars.outputs.source_sha }}
+            org.opencontainers.image.version=${{ inputs.source_ref }}
+            org.opencontainers.image.architecture=arm64
+
+          cache-from: |
+            type=gha,scope=${{ steps.vars.outputs.cache_scope }}
+          cache-to: |
+            type=gha,mode=min,scope=${{ steps.vars.outputs.cache_scope }}
+
+      - name: Write build result
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.vars.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+        run: |
+          set -Eeuo pipefail
+
+          {
+            echo
+            echo "### Docker Hub push result"
+            echo
+            echo "- Image: \`${IMAGE_REF}\`"
+            echo "- Digest: \`${IMAGE_DIGEST}\`"
+
+            if [[ "${PUSH_LATEST}" == "true" ]]; then
+              echo "- Latest tag: \`${DOCKERHUB_IMAGE}:latest\`"
+            fi
+
+            echo
+            echo "Pull command:"
+            echo
+            echo '```bash'
+            echo "docker pull ${IMAGE_REF}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
