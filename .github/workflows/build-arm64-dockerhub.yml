@@ -100,8 +100,8 @@ jobs:
           SOURCE_REF: ${{ inputs.source_ref }}
           IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
           PUSH_LATEST: ${{ inputs.push_latest }}
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_IMAGE }}
         run: |
           set -Eeuo pipefail
 
@@ -232,7 +232,7 @@ jobs:
       - name: Log in to Docker Hub
         uses: docker/login-action@v4
         with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push ARM64 image
@@ -268,7 +268,7 @@ jobs:
           IMAGE_REF: ${{ steps.vars.outputs.image_ref }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           PUSH_LATEST: ${{ inputs.push_latest }}
-          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_IMAGE }}
         run: |
           set -Eeuo pipefail
 
