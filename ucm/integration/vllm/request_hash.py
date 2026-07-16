@@ -137,8 +137,9 @@ def generate_block_extra_keys(
         end_token_idx,
         start_mm_idx,
     )
-    # UCM MM keys always precede vLLM's non-MM keys. The local schema makes
-    # this new MM representation distinct without invalidating text-only keys.
+    # UCM MM keys always precede vLLM's non-MM keys. The local schema isolates
+    # identifier-only MM entries without invalidating text-only keys already
+    # generated under the global v2 schema.
     combined = tuple(ucm_mm_keys) + tuple(non_mm_keys or ())
     return combined or None, new_start_mm_idx
 

@@ -1800,14 +1800,19 @@ class UCMCPConnector(UCMLayerWiseConnector):
         if not self.is_mla:
             vllm_config.parallel_config.tensor_parallel_size //= self.dcp_world_size
 
+        namespace = self._request_hash_namespace()
         if role == KVConnectorRole.SCHEDULER:
-            self.request_hasher = RequestHasher(vllm_config, 0)
+            self.request_hasher = RequestHasher(vllm_config, 0, namespace)
             self._other_rank_hashers = self._make_other_rank_hashers(vllm_config)
             self._seed = self.request_hasher("UCM_HASH_SEED")
             # init scheduler-size connector
             self.store = self._create_store(None)
         else:
-            self.request_hasher = RequestHasher(vllm_config, self.tp_rank)
+            self.request_hasher = RequestHasher(
+                vllm_config,
+                self.tp_rank,
+                namespace,
+            )
         vllm_config.parallel_config.tensor_parallel_size = old_tp_size
         self.block_size *= self.cp_world_size
         logger.info("Init UCMCPConnector.")

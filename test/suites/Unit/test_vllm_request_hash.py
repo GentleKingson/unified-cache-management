@@ -1,4 +1,5 @@
 import hashlib
+import importlib
 import pickle
 from types import SimpleNamespace
 from typing import Any
@@ -16,9 +17,12 @@ from ucm.integration.vllm.request_hash import (
     request_hashing_supported,
 )
 from ucm.integration.vllm.ucm_connector import (
+    KVConnectorRole,
     RequestHasher,
     UCMConnector,
+    UCMCPConnector,
     UCMDirectConnector,
+    UCMLayerWiseConnector,
 )
 
 
@@ -529,3 +533,72 @@ def test_other_scheduler_rank_hashers_use_the_operator_namespace():
 
     assert len(hashers) == 2
     assert all(hasher.meta_bytes.endswith(b":deployment-a") for hasher in hashers)
+
+
+def test_cp_scheduler_and_worker_hashers_share_namespace_and_rank_keys(monkeypatch):
+    vllm_distributed = importlib.import_module("vllm.distributed")
+    prefetched_block_ids = []
+
+    def fake_layerwise_init(self, vllm_config, _role, _kv_cache_config=None):
+        self._vllm_config = vllm_config
+        self.launch_config = {
+            "use_layerwise": True,
+            "request_hash_namespace": "deployment-a",
+        }
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.tp_rank = vllm_config.test_tp_rank
+        self.is_mla = False
+        self.block_size = 4
+        self._other_rank_hashers = []
+
+    monkeypatch.setattr(UCMLayerWiseConnector, "__init__", fake_layerwise_init)
+    monkeypatch.setattr(
+        UCMCPConnector,
+        "_create_store",
+        lambda _self, _layout: SimpleNamespace(prefetch=prefetched_block_ids.append),
+    )
+    monkeypatch.setattr(
+        vllm_distributed,
+        "get_pcp_group",
+        lambda: SimpleNamespace(world_size=1, rank_in_group=0),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        vllm_distributed,
+        "get_dcp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=0),
+        raising=False,
+    )
+
+    def config(tp_rank):
+        return SimpleNamespace(
+            test_tp_rank=tp_rank,
+            model_config=SimpleNamespace(model="model", dtype="float16"),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=4,
+                prefill_context_parallel_size=2,
+                decode_context_parallel_size=1,
+            ),
+        )
+
+    scheduler_config = config(tp_rank=0)
+    worker_config = config(tp_rank=2)
+    scheduler = UCMCPConnector(scheduler_config, KVConnectorRole.SCHEDULER)
+    worker = UCMCPConnector(worker_config, KVConnectorRole.WORKER)
+
+    assert scheduler.request_hasher.meta_bytes.endswith(b":0:deployment-a")
+    assert worker.request_hasher.meta_bytes.endswith(b":1:deployment-a")
+    assert len(scheduler._other_rank_hashers) == 1
+    assert (
+        scheduler._other_rank_hashers[0].meta_bytes == worker.request_hasher.meta_bytes
+    )
+
+    rank0_block_id = scheduler.request_hasher((b"seed", (1, 2, 3, 4), None))
+    expected_worker_block_id = worker.request_hasher(rank0_block_id)
+    assert scheduler._other_rank_hashers[0](rank0_block_id) == expected_worker_block_id
+
+    scheduler._prefetch_other_rank_hashes([rank0_block_id])
+
+    assert prefetched_block_ids == [[expected_worker_block_id]]
+    assert scheduler_config.parallel_config.tensor_parallel_size == 4
+    assert worker_config.parallel_config.tensor_parallel_size == 4
