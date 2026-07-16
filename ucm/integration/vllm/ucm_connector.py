@@ -37,6 +37,11 @@ from ucm.integration.vllm.metrics import (
     UCMConnectorStats,
     UCMPromMetrics,
 )
+from ucm.integration.vllm.request_hash import (
+    build_cache_key_namespace,
+    generate_request_block_hashes,
+    request_hashing_supported,
+)
 from ucm.logger import init_logger
 from ucm.metrics_config import (
     MULTIPROC_CONSUMER,
@@ -366,12 +371,11 @@ class RequestHasher:
     """hash(md5) request to generate ucm block id"""
 
     def __init__(self, vllm_config, rank_id, namespace: str = ""):
-        meta = (
-            f"{vllm_config.model_config.model}:"
-            f"{vllm_config.parallel_config.tensor_parallel_size}:"
-            f"{vllm_config.model_config.dtype}:{rank_id}:{namespace}"
+        self.meta_bytes = build_cache_key_namespace(
+            vllm_config,
+            rank_id,
+            namespace,
         )
-        self.meta_bytes = meta.encode("utf-8")
 
     def __call__(self, input_data) -> bytes:
         if isinstance(input_data, bytes):
@@ -480,7 +484,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
         defer_scheduler_store = getattr(self, "_defer_scheduler_store", False)
         if role == KVConnectorRole.SCHEDULER:
-            self.request_hasher = RequestHasher(vllm_config, 0)
+            namespace = self._request_hash_namespace()
+            self.request_hasher = RequestHasher(vllm_config, 0, namespace)
             self._other_rank_hashers = self._make_other_rank_hashers(vllm_config)
             self._seed = self.request_hasher("UCM_HASH_SEED")
             # init scheduler-size connector
@@ -517,7 +522,11 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if self.is_mla:
             return []
         tp_size = vllm_config.parallel_config.tensor_parallel_size
-        return [RequestHasher(vllm_config, rank_id) for rank_id in range(1, tp_size)]
+        namespace = self._request_hash_namespace()
+        return [
+            RequestHasher(vllm_config, rank_id, namespace)
+            for rank_id in range(1, tp_size)
+        ]
 
     def _apply_sdma_direct_launch_granularity(self, config: dict[str, Any]) -> None:
         if "cache_sdma_direct_launch_granularity" in config:
@@ -560,6 +569,25 @@ class UCMDirectConnector(KVConnectorBase_V1):
             ret.append(hash_value)
 
         return ret
+
+    def generate_request_hashes(
+        self,
+        request: "Request",
+        block_size: int,
+        parent_block_hash_value: bytes,
+    ) -> list[bytes]:
+        if not request_hashing_supported(request):
+            logger.warning_once(
+                f"Skip UCM persistence for request {request.request_id}: "
+                "this vLLM version cannot safely hash its semantic inputs."
+            )
+            return []
+        return generate_request_block_hashes(
+            request,
+            block_size,
+            parent_block_hash_value,
+            self.request_hasher,
+        )
 
     def _create_store(
         self,
@@ -742,8 +770,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         assert num_computed_tokens % self.block_size == 0
         hbm_hit_block_num = num_computed_tokens // self.block_size
 
-        ucm_block_ids = self.generate_hash(
-            self.hash_block_size, request.all_token_ids, self._seed
+        ucm_block_ids = self.generate_request_hashes(
+            request, self.hash_block_size, self._seed
         )
 
         if (

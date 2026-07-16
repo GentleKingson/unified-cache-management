@@ -24,6 +24,10 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ucm.integration.vllm.device import create_device
+from ucm.integration.vllm.request_hash import (
+    generate_request_block_hashes,
+    request_hashing_supported,
+)
 from ucm.integration.vllm.ucm_connector import (
     KVCacheLayout,
     PendingDumpTask,
@@ -241,9 +245,10 @@ class KVCacheGroupManager:
         return len(self.groups_by_id)
 
     def compute_block_hashes(
-        self, group: GroupInfo, token_ids: list[int]
+        self, group: GroupInfo, request: "Request"
     ) -> list[bytes]:
-        """Hash ``token_ids`` into per-block ids using ``group``'s chain seed."""
+        """Hash a request into per-block ids using ``group``'s chain seed."""
+        token_ids = request.all_token_ids
         if group.is_mamba_align:
             # In mamba-align mode vLLM pads the per-request block table with
             # block_id=0 and only keeps the current state block as a real
@@ -251,27 +256,21 @@ class KVCacheGroupManager:
             # create keys for pages that can never be loaded or dumped.
             return [b""] * (len(token_ids) // group.block_size)
 
-        ret: list[bytes] = []
-        parent = group.seed
-        block_size = group.block_size
-        for start in range(0, len(token_ids), block_size):
-            end = start + block_size
-            block_token_ids = token_ids[start:end]
-            if len(block_token_ids) < block_size:
-                break
-            hash_value = self.request_hasher((parent, tuple(block_token_ids)))
-            parent = hash_value
-            ret.append(hash_value)
-        return ret
+        return generate_request_block_hashes(
+            request,
+            group.block_size,
+            group.seed,
+            self.request_hasher,
+        )
 
-    def compute_all_group_block_ids(self, token_ids: list[int]) -> list[list[bytes]]:
+    def compute_all_group_block_ids(self, request: "Request") -> list[list[bytes]]:
         """Compute full block hashes for every group, indexed by group_id.
 
-        ``ret[gid]`` covers all aligned blocks of ``token_ids`` using group
+        ``ret[gid]`` covers all aligned blocks of the request using group
         ``gid``'s ``block_size`` and chain seed. The trailing partial block
         (if any) is dropped, matching :meth:`compute_block_hashes`.
         """
-        return [self.compute_block_hashes(g, token_ids) for g in self.groups_by_id]
+        return [self.compute_block_hashes(g, request) for g in self.groups_by_id]
 
     def compute_mamba_align_state_hash(
         self,
@@ -856,9 +855,16 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             )
             return 0, False
 
+        if not request_hashing_supported(request):
+            logger.warning_once(
+                f"Skip UCM persistence for request {request.request_id}: "
+                "this vLLM version cannot safely hash its semantic inputs."
+            )
+            return 0, False
+
         # Hash once per group so dump path can later reuse the same block ids.
         group_ucm_block_ids = self.group_manager.compute_all_group_block_ids(
-            request.all_token_ids
+            request
         )
         # Legacy ``ucm_block_ids`` mirrors the first full-attn group (by
         # group_id order) for callers that still consume the flat list.
