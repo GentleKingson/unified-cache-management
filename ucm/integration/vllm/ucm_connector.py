@@ -1158,6 +1158,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 logger.error(f"wait for dump kv cache failed. {type(e).__name__}: {e}")
         self._pending_dump_tasks = remaining_tasks
 
+    def shutdown(self) -> None:
+        """Drain in-flight dumps before vLLM tears down the connector."""
+        self._flush_pending_dump_tasks()
+
     def handle_preemptions(
         self,
         kv_connector_metadata: KVConnectorMetadata | set[str],
@@ -2333,6 +2337,11 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         self.connector.handle_preemptions(kv_connector_metadata)
+
+    def shutdown(self) -> None:
+        shutdown = getattr(getattr(self, "connector", None), "shutdown", None)
+        if callable(shutdown):
+            shutdown()
 
     def has_connector_metadata(self) -> bool:
         """Check whether the connector metadata is currently set.

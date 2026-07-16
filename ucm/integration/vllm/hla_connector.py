@@ -244,9 +244,7 @@ class KVCacheGroupManager:
     def num_groups(self) -> int:
         return len(self.groups_by_id)
 
-    def compute_block_hashes(
-        self, group: GroupInfo, request: "Request"
-    ) -> list[bytes]:
+    def compute_block_hashes(self, group: GroupInfo, request: "Request") -> list[bytes]:
         """Hash a request into per-block ids using ``group``'s chain seed."""
         token_ids = request.all_token_ids
         if group.is_mamba_align:
@@ -863,9 +861,22 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             return 0, False
 
         # Hash once per group so dump path can later reuse the same block ids.
-        group_ucm_block_ids = self.group_manager.compute_all_group_block_ids(
-            request
-        )
+        group_ucm_block_ids = self.group_manager.compute_all_group_block_ids(request)
+        # ``generate_request_block_hashes`` fails closed with an empty list
+        # when semantic extra-key generation fails at runtime.  Do not let one
+        # failed full-attention group fall through to lookup or create request
+        # metadata that could later drive a token-only dump.
+        for group in self.group_manager.full_attn_groups:
+            expected_blocks = len(request.all_token_ids) // group.block_size
+            actual_blocks = len(group_ucm_block_ids[group.group_id])
+            if actual_blocks != expected_blocks:
+                logger.warning_once(
+                    f"Skip UCM persistence for request {request.request_id}: "
+                    f"full-attention group {group.group_id} generated "
+                    f"{actual_blocks} of {expected_blocks} safe block hashes."
+                )
+                return 0, False
+
         # Legacy ``ucm_block_ids`` mirrors the first full-attn group (by
         # group_id order) for callers that still consume the flat list.
         primary_full_attn = self.group_manager.full_attn_groups[0]
